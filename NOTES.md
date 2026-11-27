@@ -17,6 +17,7 @@ point at one: `# see NOTES.md: the husk`.
 - [ais_bench_benchmark — the date-stamped pin](#ais_bench_benchmark--the-date-stamped-pin)
 - [DEVICE_MODE and DRIVER_MOUNT](#device_mode-and-driver_mount)
 - [Build provenance, and purging a cache you cannot trust](#build-provenance-and-purging-a-cache-you-cannot-trust)
+- [csrc/build belongs to one container](#csrcbuild-belongs-to-one-container)
 - [no_proxy must cover this host's own names](#no_proxy-must-cover-this-hosts-own-names)
 - [The kernel marker, and "first start is seconds"](#the-kernel-marker-and-first-start-is-seconds)
 - [MOUNT_TOOLS — whose tools/ actually runs](#mount_tools--whose-tools-actually-runs)
@@ -370,35 +371,90 @@ kill and `rm` — that is what makes "first start is seconds" possible, and it i
 also the one thing in this design that can quietly poison a build. Nothing
 invalidates `csrc/build`, the `.so` or a leftover `*.egg-info` on its own.
 
-Three ways they stop describing what is about to be built, and all three are
+Four ways they stop describing what is about to be built, and all four are
 silent until cmake fails strangely — or, worse, succeeds against the wrong
 objects:
 
-| what happened | how it shows in the marker |
-|---|---|
-| a stale build of a different version — `git checkout`, `pull` or `rebase` moved the source under a finished build | `src=` differs |
-| the checkout was built on a **different box**, then copied or moved | `host=` differs |
-| a previous install **failed or was killed** mid-build | there is build output and **no marker at all** |
+| what happened | how it is detected | what is removed |
+|---|---|---|
+| **cmake's tree was configured in another container** — every `docker rm` and re-create | the stamp in `csrc/build` is not this container's | `csrc/build` only |
+| a stale build of a different version — `git checkout`, `pull` or `rebase` moved the source under a finished build | `src=` differs | all of it |
+| the checkout was built on a **different box**, then copied or moved | `host=` differs | all of it |
+| a previous install **failed or was killed** mid-build | there is build output and **no marker at all** | all of it |
+
+The first row is the common one and was the original omission here: the marker
+asks whether the *kernels* were built for this configuration, and on a plain
+re-create the answer is yes — same box, same image, same commit. So nothing was
+purged, and cmake was handed a tree belonging to a container that no longer
+existed. That question needed asking separately; see the next section.
 
 That last one needs no new state: the bootstrap deletes the marker *before* a
 build starts and writes it only once one has produced a `.so`. So build output
 with no marker beside it is, by construction, the residue of a build that never
 finished.
 
-In all three cases `purge_stale_build` removes, **before** `pip install -e`
-rather than building on top of it: `csrc/build`, the stale `.so`, the top-level
-`build/` tree and any leftover `*.egg-info`. It says which field moved and what
-it removed. When the marker agrees, nothing is touched and cmake stays
+`purge_stale_build` does the removal **before** `pip install -e` rather than
+building on top of it, and says which field moved and what it took. When nothing
+moved and the tree is this container's, nothing is touched and cmake stays
 incremental — a purge needs *evidence*, never the mere absence of it.
 
-`csrc/build_cache` is **kept**: it is keyed by source content, so its compiled
-kernels still match wherever the sources did not move, and dropping it turns an
-incremental rebuild into a total one. `PURGE_BUILD_CACHE=1` drops it too, for
-when a purge did not fix the build:
+`csrc/build_cache` holds compiled kernel objects, not cmake state, so it follows
+the **kernels**: dropped whenever they are, kept when only the container
+changed. `PURGE_BUILD_CACHE=1` drops it on a mere reconfigure too, and
+`--clean-kernels` drops both trees outright without consulting any of the above
+— that is the one to reach for when the checks said the tree was fine and the
+build failed anyway:
 
 ```bash
-PURGE_BUILD_CACHE=1 ./run_container.sh dev --recreate
+./run_container.sh dev --recreate --clean-kernels
 ```
+
+Inside a container that is already up, which is cheaper than re-creating one:
+
+```bash
+docker exec -it NAME bash /opt/vllm-dev/bootstrap_editable.sh --clean-kernels --force
+```
+
+## csrc/build belongs to one container
+
+`csrc/build` is cmake's own tree, and every path cmake writes into it is
+absolute and **inside the container that configured it** — ninja, the
+compilers, `Torch_DIR`, the interpreter. The tree itself lives in your mounted
+checkout. So `docker rm` takes the container and leaves the tree, and the next
+container reconfigures against paths belonging to one that no longer exists.
+
+This is a different question from the kernel marker's, and treating them as one
+was the mistake that made a plain `--recreate` walk into a broken build:
+
+* **the `.so` survives a re-create** — it is a compiled artifact in your
+  checkout, which is exactly why "first start is seconds" works;
+* **cmake's tree never does** — it is container-local state that happens to be
+  stored in your checkout.
+
+So the tree carries its own stamp, `csrc/build/.vllm-ascend-dev-env`.
+`run_container.sh` mints a `BUILD_ENV_ID` once per `docker run` and passes it
+in; the bootstrap writes it into the stamp after a successful build and compares
+on the way in. Losing the tree costs a **cmake reconfigure**, not a kernel
+rebuild.
+
+A `docker stop` / `docker start` keeps the container *and its environment*, so
+the token is unchanged and the tree is correctly judged to be its own. Only a
+re-create mints a new one. An unset `BUILD_ENV_ID` — the bootstrap run by hand,
+or a container this bundle did not start — makes no claim either way, the same
+rule the marker follows.
+
+Two older checks remain as a backstop for a tree that was never stamped, one
+built before the stamp existed or by hand:
+
+* `moved_cmake_source` compares the cache's `CMAKE_HOME_DIRECTORY` against the
+  checkout. cmake refuses outright to run against a different source dir than
+  the one its cache was generated for, which is what a renamed or moved
+  checkout hits.
+* `stale_cmake_cache` reports every cached **absolute path that no longer
+  exists** — not a hand-picked list of variable names, which could never keep up
+  with what the checkout's `CMakeLists.txt` caches. It needs no list: a cached
+  path that is not there is broken whatever it is called. `INTERNAL` and `BOOL`
+  entries are skipped, and a `;`-separated list is checked element by element.
 
 `./run_container.sh --dry-run` names the fields that moved before it starts
 anything, and inside a container so does
@@ -513,11 +569,17 @@ output *is* ours and still cannot be used as it stands:
   when `/proc/<pid>` is gone.
 * **stale `CMakeCache.txt`.** It records absolute paths from the container that
   wrote it. A different image, or a different `ASCEND_HOME`, and cmake fails
-  pointing at paths that are not there. The bootstrap detects this and
-  `rm -rf csrc/build` — deliberately **keeping** `csrc/build_cache`, which is
-  what makes the rebuild incremental rather than total.
+  pointing at paths that are not there. The bootstrap drops `csrc/build` and
+  keeps `csrc/build_cache`, so the rebuild is incremental rather than total.
+  Since `csrc/build` is now stamped with the container that configured it, this
+  check should no longer fire on a re-create — it is the backstop for a tree
+  that was never stamped, and for a cache broken by something other than the
+  container going away. Same for `moved_cmake_source`, which catches the
+  checkout being renamed or moved.
 
-`--clean-kernels` does that removal unconditionally.
+`--clean-kernels` removes **both** trees unconditionally, consulting none of
+this. It is the hammer for when every check above said the tree was fine and the
+build failed anyway.
 
 ## git safe.directory
 

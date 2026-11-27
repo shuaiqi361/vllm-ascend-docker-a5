@@ -22,6 +22,12 @@
 #                                        those at creation; a running container
 #                                        still has the old ones)
 #    ./run_container.sh dev --no-attach  start it, stay on the host
+#    ./run_container.sh dev --recreate --clean-kernels
+#                                        same, but drop csrc/build AND
+#                                        csrc/build_cache first. For a kernel
+#                                        build that fails on state in your
+#                                        checkout rather than on your code.
+#                                        Tens of minutes: it rebuilds in full.
 #
 #  Try anything for one run without editing a file:
 #    IMAGE=vllm-ascend:some-tag ./run_container.sh --dry-run
@@ -62,6 +68,9 @@ set -- ${AEE_ARGS[@]+"${AEE_ARGS[@]}"}   # require_docker, and --help
 # --env-file and -h/--help are consumed by load_env.sh above.
 SUFFIX="dev"; RECREATE=0; DRY_RUN=0
 suffix_set=0
+# Passed into the container, which is the only way to steer the bootstrap the
+# entrypoint runs on a creating run. Saves reaching into the checkout by hand.
+CLEAN_KERNELS=0
 # Whether --privileged / --no-privileged was TYPED: DEVICE_MODE=privileged
 # implies it, and a typed flag has to beat an implication.
 priv_explicit=0
@@ -70,6 +79,7 @@ priv_explicit=0
 while (( $# )); do
     case "$1" in
         --recreate)        RECREATE=1 ;;
+        --clean-kernels)   CLEAN_KERNELS=1 ;;
         --no-attach)       ATTACH=0 ;;
         --attach)          ATTACH=1 ;;
         --dry-run)         DRY_RUN=1 ;;
@@ -232,6 +242,17 @@ report_bootstrap() {
 # The commonest command of the day, and it needs no image and no path checks —
 # only the bootstrap's verdict, which costs one `docker exec cat`.
 existing_state="$(docker inspect -f '{{.State.Status}}' "${NAME}" 2>/dev/null)"
+# The container's environment is fixed at creation, so --clean-kernels can only
+# be delivered by a run that creates one. Said here rather than letting the flag
+# look like it worked.
+if [[ -n "${existing_state}" ]] && (( CLEAN_KERNELS )) && (( ! RECREATE )); then
+    die "--clean-kernels needs a container to be created, and ${NAME} already exists.
+    docker fixes a container's environment at creation, so there is nothing to
+    deliver the flag to. Either re-create it:
+        ./run_container.sh ${SUFFIX} --recreate --clean-kernels
+    or clean from inside the one that is already running, which is cheaper:
+        docker exec -it ${NAME} bash ${DEV_TOOLS_DIR}/bootstrap_editable.sh --clean-kernels --force"
+fi
 if [[ -n "${existing_state}" ]] && (( ! RECREATE )); then
     case "${existing_state}" in
         running)
@@ -653,6 +674,28 @@ host_build_id() {
     fi
 }
 BUILD_HOST_ID="$(host_build_id)"
+# One token per `docker run`, handed to the container so it can tell whether
+# cmake's tree in csrc/build was configured by ITSELF or by a container that has
+# since been removed. Every path cmake caches there is absolute and inside the
+# container that wrote it, while the tree sits in your mounted checkout and
+# outlives it — which is why a plain --recreate used to walk into a build that
+# could not work. A docker start of an EXISTING container keeps its environment
+# and so keeps this token, which is correct: that tree really is still its own.
+# see NOTES.md: csrc/build belongs to one container
+BUILD_ENV_ID="$(date +%s)-$$-${RANDOM}"
+
+# Is the build tree in the checkout going to be dropped as foreign? Predicted
+# with the same stamp the container compares, so the report cannot promise an
+# incremental build the bootstrap is about to discard.
+BUILD_ENV_STAMP="csrc/build/.vllm-ascend-dev-env"
+foreign_tree_note() {
+    [[ -d "${VLLM_ASCEND_DIR}/csrc/build" ]] || { printf 'none yet'; return; }
+    local stamp="${VLLM_ASCEND_DIR}/${BUILD_ENV_STAMP}"
+    [[ -f "${stamp}" ]] || { printf 'present, unstamped — will be dropped and reconfigured'; return; }
+    # Any stamp at all means some container owns it; this run mints a new token,
+    # so a container being CREATED never owns it.
+    printf 'present, belongs to another container — will be dropped and reconfigured'
+}
 
 BUILD_KEY="soc=${SOC_VERSION};py=${PROBE_PY};img=${IMAGE_KEY}"
 [[ -n "${SRC_REF}" ]]       && BUILD_KEY="${BUILD_KEY};src=${SRC_REF}"
@@ -918,8 +961,13 @@ OPTIONAL_ENV=(
     # is omitted when it could not be derived, which the container reads as
     # "unknown" and never as "stale". see NOTES.md: Build provenance
     SRC_REF BUILD_HOST_ID
+    # Which container owns cmake's tree in csrc/build, minted per `docker run`.
+    # see NOTES.md: csrc/build belongs to one container
+    BUILD_ENV_ID
     # 1 = a purge drops csrc/build_cache as well. see NOTES.md: Build provenance
     PURGE_BUILD_CACHE
+    # --clean-kernels: drop csrc/build AND csrc/build_cache before installing.
+    CLEAN_KERNELS
     # 0 turns the bootstrap's husk removal into a report. see NOTES.md: The husk
     PURGE_HUSK
     # Where the bootstrap writes the == entries of PIP_PINS as a pip constraints
@@ -993,6 +1041,9 @@ DOCKER_CMD=( docker run -d --name "${NAME}" -w "${WORKDIR}"
 # ── report ───────────────────────────────────────────────────────────────────
 # Built before the heredoc: a ${x} nested inside a ${x:+...} is not a valid
 # substitution, and the failure is a runtime one that bash -n cannot see.
+TREE_LINE="$(foreign_tree_note)"
+(( CLEAN_KERNELS )) && TREE_LINE+="
+               --clean-kernels: csrc/build AND csrc/build_cache go first"
 CONFIG_LINE="  config     : ${AEE_LOADED:-<none>}"
 if [[ -n "${AEE_SHADOWED}" ]]; then
     CONFIG_LINE+=$'\n'"  overriding : ${AEE_SHADOWED}  (set outside a5.env, so its EDIT BLOCK value is ignored)"
@@ -1024,6 +1075,7 @@ ${CONFIG_LINE}
   bootstrap  : ${BOOTSTRAP_ON_START}  (pip install -e your checkouts)
   kernels    : ${KERNELS_NOTE}
   kernel key : ${BUILD_KEY}
+  cmake tree : ${TREE_LINE}
   pip index  : ${PIP_INDEX_URL:-the pip.conf inside the image (PIP_INDEX_URL unset in a5.env)}
   pip proxy  : $(mask_url "${BUILD_HTTPS_PROXY:-${BUILD_HTTP_PROXY:-}}")$( [[ -z "${BUILD_HTTPS_PROXY}${BUILD_HTTP_PROXY}" ]] && echo none )
   no_proxy   : ${NO_PROXY_LIST}

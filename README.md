@@ -213,17 +213,30 @@ is the point, and also the one thing that can poison a build. Before installing,
 the bootstrap checks what the marker says the output was made for and **removes
 it rather than build on top of it** when any of these holds:
 
-| | the marker shows |
-|---|---|
-| a stale build of a different version (`git checkout` / `pull` / `rebase` moved the source) | `src=` differs |
-| built on a **different box**, then copied or moved | `host=` differs |
-| a previous install **failed or was killed** mid-build | build output with **no marker** |
+| | detected by | removed |
+|---|---|---|
+| **cmake's tree was configured in another container** — i.e. every `--recreate` | the stamp in `csrc/build` | `csrc/build` only; kernels kept |
+| a stale build of a different version (`git checkout` / `pull` / `rebase` moved the source) | `src=` differs | all of it |
+| built on a **different box**, then copied or moved | `host=` differs | all of it |
+| a previous install **failed or was killed** mid-build | build output with **no marker** | all of it |
 
-It removes `csrc/build`, the stale `.so`, `build/` and any leftover
-`*.egg-info`, and names the field that moved. When the marker agrees nothing is
-touched and cmake stays incremental — a purge needs evidence, not the absence of
-it. `csrc/build_cache` is kept because it is content-keyed; `PURGE_BUILD_CACHE=1`
-drops that too. `--dry-run` tells you all of this before it starts anything.
+The first row is the common one: `csrc/build` is cmake's tree and every path in
+it is absolute *inside the container that wrote it*, while the tree itself sits
+in your checkout — so `docker rm` leaves it behind for a container that cannot
+use it. Dropping it costs a cmake reconfigure, not a kernel rebuild. The `.so`
+survives a recreate, which is what makes "first start is seconds" true.
+
+When nothing moved and the tree is this container's, nothing is touched and
+cmake stays incremental — a purge needs evidence, not the absence of it.
+`csrc/build_cache` follows the kernels: dropped when they are, kept when only
+the container changed. `--dry-run` reports all of it before starting anything.
+
+When the checks say the tree is fine and the build still fails, take both trees
+out explicitly rather than by hand:
+
+```bash
+./run_container.sh dev --recreate --clean-kernels
+```
 
 What each field of the marker means, and why:
 [NOTES.md — The kernel marker](NOTES.md#the-kernel-marker-and-first-start-is-seconds)
@@ -241,7 +254,7 @@ docker exec -it NAME bash /opt/vllm-dev/bootstrap_editable.sh --check
 | `--force` | reinstall vllm-ascend and rebuild the kernels, incrementally (after a `csrc/` change) |
 | `--force-all` | also re-install vLLM. Rare. |
 | `--deps` | re-resolve dependencies too (after a `requirements*.txt` change). Needs network in the container. |
-| `--clean-kernels` | `rm -rf csrc/build` first, keeping `csrc/build_cache`. For a build that fails on stale cmake state. The provenance purge above is automatic; this is the manual one, for when the marker agrees and the tree is still wrong. |
+| `--clean-kernels` | `rm -rf` **both** `csrc/build` and `csrc/build_cache` first, consulting nothing. The purge above is automatic and conservative; this is the big hammer, for when it said the tree was fine and the build failed anyway. A full rebuild follows. |
 | *(none)* | do whatever is missing. This is what the entrypoint runs on every start. |
 
 `./manage_containers.sh` → `c <n>` runs the `--check` for you, and
@@ -291,8 +304,8 @@ what the message looks like:
 | a serve hangs or 502s on its own `/health` | an `http_proxy` swallowing traffic to this host. [NOTES.md](NOTES.md#no_proxy-must-cover-this-hosts-own-names) |
 | your edit to a `tools/` script does nothing | the image's baked copy is what runs. `MOUNT_TOOLS=1`. [NOTES.md](NOTES.md#mount_tools--whose-tools-actually-runs) |
 | a kernel build that should be incremental rebuilds everything, or waits forever | a stale `CMakeCache.txt` or a stale opc lock. [NOTES.md](NOTES.md#stale-opc-locks-and-stale-cmakecache) |
-| a `--recreate` says `removing stale build output` and rebuilds | the build in your checkout was made for a different source commit, image or box, or by a build that was killed. Intended: it is removed rather than built on. `--dry-run` names the field. [NOTES.md](NOTES.md#build-provenance-and-purging-a-cache-you-cannot-trust) |
-| a rebuild after a purge still fails in cmake or links the wrong objects | `csrc/build_cache` survived the purge. `PURGE_BUILD_CACHE=1 ./run_container.sh dev --recreate`. [NOTES.md](NOTES.md#build-provenance-and-purging-a-cache-you-cannot-trust) |
+| a `--recreate` says `removing stale build output` | intended. The tree was made in another container, or for a different commit / image / box, and is removed rather than built on. `--dry-run` names which. [NOTES.md](NOTES.md#build-provenance-and-purging-a-cache-you-cannot-trust) |
+| the same kernel-build error survives a `docker rm` and a fresh container, and only `rm -rf csrc/build csrc/build_cache` fixes it | what this check exists to stop. If it still happens, `./run_container.sh dev --recreate --clean-kernels` does exactly that removal — and the error text is worth reporting, because the check should have caught it. [NOTES.md](NOTES.md#csrcbuild-belongs-to-one-container) |
 | `[ascend_env] no …/ascend-toolkit/set_env.sh` | the image keeps CANN somewhere other than `ASCEND_HOME`. `./probe_image.sh <ref>` prints where. |
 | `cannot talk to the docker daemon` | `systemctl start docker`, or you are not in the `docker` group yet (`newgrp docker`). |
 

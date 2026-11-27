@@ -22,10 +22,10 @@
 #                     it first whenever something imports from the wrong place.
 #    --deps           resolve dependencies too, after a requirements*.txt change.
 #    --force-all      re-install vllm as well. Rare; after a failed bootstrap.
-#    --clean-kernels  delete csrc/build, KEEP csrc/build_cache, for a build tree
-#                     in a state a lock sweep does not explain. The provenance
-#                     purge below is automatic; this is the manual one, for when
-#                     the marker agrees and the tree is still wrong.
+#    --clean-kernels  delete BOTH csrc/build and csrc/build_cache, consulting
+#                     nothing. The checks below are automatic and conservative;
+#                     this is the big hammer, for when they said the tree was
+#                     fine and the build failed anyway. A full rebuild follows.
 #
 #  You edited PYTHON? Run nothing — the sources are bind-mounted and editable.
 #
@@ -111,16 +111,25 @@ TRITON_WHEEL_DIR="${TRITON_WHEEL_DIR:-}"
 # 0 = report and refuse. The alternative to 1 is python importing an empty
 # module and every number you measure being wrong.
 PURGE_HUSK="${PURGE_HUSK:-1}"
-# 1 = a purge also drops csrc/build_cache, the content-keyed store behind the
-# log's "[build-cache] HIT". Kept by default: dropping it turns an incremental
-# rebuild into a total one. Set it when a purge did not fix the build.
+# 1 = always drop csrc/build_cache (compiled kernel objects) when anything is
+# purged, not only when the kernels themselves are invalidated. Costs a full
+# rebuild; set it when a purge did not fix the build.
 # see NOTES.md: Build provenance, and purging a cache you cannot trust
 PURGE_BUILD_CACHE="${PURGE_BUILD_CACHE:-0}"
+# Minted by run_container.sh once per `docker run` and compared against the
+# stamp inside csrc/build: cmake's tree is only valid in the container that
+# configured it. Empty = run by hand, so no claim is made either way.
+# see NOTES.md: csrc/build belongs to one container
+BUILD_ENV_ID="${BUILD_ENV_ID:-}"
+BUILD_ENV_STAMP="${BUILD_ENV_STAMP:-csrc/build/.vllm-ascend-dev-env}"
 
 MODE="auto"
 WITH_DEPS=0
 # 1 = delete the kernel build tree before rebuilding. See clean_kernel_build.
-CLEAN_KERNELS=0
+# Read from the environment as well as --clean-kernels, so run_container.sh can
+# ask for it on the run that CREATES a container — the only moment at which the
+# entrypoint bootstrap can be steered at all.
+CLEAN_KERNELS="${CLEAN_KERNELS:-0}"
 for arg in "$@"; do
     case "$arg" in
         --check)     MODE="check" ;;
@@ -797,35 +806,74 @@ clear_stale_kernel_locks() {
 # csrc/build inside your mounted checkout, and nothing invalidates it on its own
 # — not --force, not a different image.
 # see NOTES.md: Stale opc locks and stale CMakeCache
+# Every cached absolute path, not a hand-picked list of ten variable names: the
+# list could never keep up with what the checkout's CMakeLists.txt caches, and
+# the test needs no list — a cached absolute path that does not exist is broken,
+# whatever it is called. INTERNAL entries are cmake's own bookkeeping and are
+# skipped, as are the source and binary dirs, which get their own check below.
 stale_cmake_cache() {   # prints the dead entries, returns 0 if any
-    local cache="${VLLM_ASCEND_DIR}/csrc/build/CMakeCache.txt" line k v bad=""
+    local cache="${VLLM_ASCEND_DIR}/csrc/build/CMakeCache.txt" line k t v bad="" n=0
     [[ -f "${cache}" ]] || return 1
     while IFS= read -r line; do
         case "${line}" in
-            CMAKE_MAKE_PROGRAM:*|CMAKE_C_COMPILER:*|CMAKE_CXX_COMPILER:*|\
-            CMAKE_COMMAND:*|CMAKE_AR:*|CMAKE_LINKER:*|CMAKE_RANLIB:*|\
-            CMAKE_STRIP:*|Python3_EXECUTABLE:*|PYTHON_EXECUTABLE:*)
-                k="${line%%:*}"; v="${line#*=}"
-                [[ "${v}" == /* ]] || continue
-                [[ -e "${v}" ]] || bad="${bad}
-       ${k} = ${v}"
-                ;;
+            ''|'#'*|'//'*) continue ;;
+            *:*=*) ;;
+            *) continue ;;
         esac
+        k="${line%%:*}"; t="${line#*:}"; t="${t%%=*}"; v="${line#*=}"
+        case "${t}" in INTERNAL|BOOL) continue ;; esac
+        case "${k}" in CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR) continue ;; esac
+        [[ "${v}" == /* ]] || continue
+        # Only ever a diagnosis of "that is not here any more", so a value that
+        # is a list is split and each element checked.
+        local part
+        for part in ${v//;/ }; do
+            [[ "${part}" == /* ]] || continue
+            [[ -e "${part}" ]] && continue
+            n=$(( n + 1 ))
+            (( n <= 6 )) && bad="${bad}
+       ${k} = ${part}"
+        done
     done < "${cache}"
     [[ -n "${bad}" ]] || return 1
+    (( n > 6 )) && bad="${bad}
+       ... and $(( n - 6 )) more"
     printf '%s\n' "${bad}"
+    return 0
+}
+# cmake records the source dir it was configured for and refuses to run against
+# a different one ("does not match the source ... used to generate cache").
+# A checkout that moved or was renamed hits this, and the message names cmake.
+moved_cmake_source() {
+    local cache="${VLLM_ASCEND_DIR}/csrc/build/CMakeCache.txt" home
+    [[ -f "${cache}" ]] || return 1
+    home="$(sed -n 's/^CMAKE_HOME_DIRECTORY:[^=]*=//p' "${cache}" | head -1)"
+    [[ -n "${home}" ]] || return 1
+    [[ "${home}" == "${VLLM_ASCEND_DIR}/csrc" ]] && return 1
+    printf '%s\n' "${home}"
     return 0
 }
 
 # Cheaper than it sounds: csrc/build is generated output, while csrc/build_cache
 # — what makes the log say "[build-cache] HIT" — is KEPT.
+# The manual clean: both trees, because this is what you reach for when the
+# automatic checks said the tree was fine and the build still failed — and
+# leaving half of it behind is what makes you do it by hand afterwards.
 clean_kernel_build() {
     local build="${VLLM_ASCEND_DIR}/csrc/build"
-    [[ -d "${build}" ]] || { say "no csrc/build to clean"; return 0; }
-    say "--clean-kernels: removing ${build}"
-    say "  csrc/build_cache is NOT touched, so the cached kernel binaries survive"
-    say "  and this costs far less than a first build."
-    rm -rf "${build}" || warn "could not remove ${build} — check permissions on your checkout"
+    local cache="${VLLM_ASCEND_DIR}/csrc/build_cache"
+    local did=0
+    if [[ -d "${build}" ]]; then
+        rm -rf "${build}" && { say "--clean-kernels: removed csrc/build"; did=1; } \
+            || warn "could not remove ${build} — check permissions on your checkout"
+    fi
+    if [[ -d "${cache}" ]]; then
+        rm -rf "${cache}" && { say "--clean-kernels: removed csrc/build_cache"; did=1; } \
+            || warn "could not remove ${cache} — check permissions on your checkout"
+    fi
+    (( did )) && say "  the next kernel build is a full one: tens of minutes, once." \
+              || say "no csrc/build or csrc/build_cache to clean"
+    return 0
 }
 # Field-wise rather than one string comparison, so a field the stored marker
 # does not carry is treated as UNKNOWN and not as a mismatch. That is what lets
@@ -849,56 +897,109 @@ marker_ok() {
     [[ -f "${MARKER}" ]] && ! marker_mismatch >/dev/null
 }
 
+# ── csrc/build belongs to ONE container, and only that one ───────────────────
+# Every path cmake writes into csrc/build — ninja, the compilers, torch's cmake
+# package, the interpreter — is an absolute path INSIDE the container that
+# configured it. The tree itself sits in your mounted checkout, so `docker rm`
+# takes the container away and leaves the tree behind. cmake then reconfigures
+# against a container that no longer exists, and what it reports has nothing to
+# do with your code.
+#
+# This is a DIFFERENT question from the kernel marker's, and conflating the two
+# was the original mistake here. The marker asks "were these kernels built for
+# this soc / python / image / commit / box", and the answer survives a recreate
+# — the .so lives in your checkout, which is exactly why first start is seconds.
+# cmake's own tree never survives one. So it carries its own stamp, and losing
+# it costs a cmake reconfigure, not a kernel rebuild.
+#
+# run_container.sh mints BUILD_ENV_ID once per `docker run` and passes it in. A
+# stop/start keeps the container and its environment, so the tree stays valid;
+# only a recreate mints a new id. Unset means the bootstrap was run by hand, or
+# in a container this bundle did not start — unknown, so no claim is made.
+# see NOTES.md: csrc/build belongs to one container
+foreign_build_tree() {   # prints what wrote it; returns 0 if it was not us
+    [[ -n "${BUILD_ENV_ID}" ]] || return 1
+    [[ -d "${VLLM_ASCEND_DIR}/csrc/build" ]] || return 1
+    local stamp="${VLLM_ASCEND_DIR}/${BUILD_ENV_STAMP}" was
+    [[ -f "${stamp}" ]] || { printf 'an unstamped container\n'; return 0; }
+    was="$(tr -d '\r\n' < "${stamp}" 2>/dev/null)"
+    [[ "${was}" == "${BUILD_ENV_ID}" ]] && return 1
+    printf 'container env %s\n' "${was:-<empty stamp>}"
+    return 0
+}
+stamp_build_tree() {
+    local stamp="${VLLM_ASCEND_DIR}/${BUILD_ENV_STAMP}"
+    [[ -n "${BUILD_ENV_ID}" && -d "${VLLM_ASCEND_DIR}/csrc/build" ]] || return 0
+    printf '%s\n' "${BUILD_ENV_ID}" > "${stamp}" 2>/dev/null \
+        || warn "could not stamp ${stamp}; csrc/build will be dropped again next recreate"
+}
+
 # Build output lives in your MOUNTED checkout, so it outlives every container
-# and nothing invalidates it on its own. Three ways it stops describing what is
+# and nothing invalidates it on its own. Four ways it stops describing what is
 # about to be built, all of them silent until cmake fails strangely or — worse —
 # succeeds against the wrong objects:
+#   * cmake's tree was configured in ANOTHER container (every recreate);
 #   * the marker records a different soc, python, image or source commit;
 #   * the marker records a different box;
 #   * there is build output and NO marker, which is exactly what a build that
 #     was killed or failed leaves: the marker is deleted before a build starts
 #     and written only once one has produced a .so.
+# The first costs a reconfigure and keeps the kernels. The rest invalidate the
+# kernels themselves, so they take the .so and the install leftovers too.
 # A first build has no output and so no decision to make.
 # see NOTES.md: Build provenance, and purging a cache you cannot trust
 purge_stale_build() {
     local build="${VLLM_ASCEND_DIR}/csrc/build"
     local cache="${VLLM_ASCEND_DIR}/csrc/build_cache"
-    local reason moved
+    local reason moved wrote kernels_too=0
     local -a sos=() eggs=()
     mapfile -t sos  < <(compgen -G "${VLLM_ASCEND_DIR}/${KERNEL_SO_GLOB}" 2>/dev/null)
     mapfile -t eggs < <(compgen -G "${VLLM_ASCEND_DIR}/*.egg-info" 2>/dev/null)
     [[ -d "${build}" || ${#sos[@]} -gt 0 ]] || return 0
 
     if moved="$(marker_mismatch)"; then
-        reason="it was built for a different ${moved// /, }"
+        reason="it was built for a different ${moved// /, }"; kernels_too=1
     elif [[ ! -f "${MARKER}" ]]; then
         reason="there is build output but no ${KERNEL_MARKER}, so whatever produced it never finished"
+        kernels_too=1
+    elif wrote="$(foreign_build_tree)"; then
+        reason="cmake's tree in csrc/build was configured by ${wrote}, which is gone.
+    Every tool path it cached pointed inside that container. Your kernels are
+    NOT affected and are kept — this costs a cmake reconfigure, not a rebuild"
     else
-        return 0   # the marker agrees: this tree is ours, and cmake is incremental
+        return 0   # ours, this container, these sources: cmake is incremental
     fi
 
     warn "removing stale build output from your checkout before installing:
     ${reason}.
         marker holds : $( [[ -f "${MARKER}" ]] && tr -d '\r\n' < "${MARKER}" || echo '<no marker file>' )
-        marker wants : ${BUILD_KEY}
-    Keeping it would feed cmake objects and a CMakeCache that do not match this
-    toolchain or these sources. csrc/ is rebuilt from scratch below."
-    rm -f "${MARKER}"
+        marker wants : ${BUILD_KEY}"
+    (( kernels_too )) && rm -f "${MARKER}"
     if [[ -d "${build}" ]]; then
         rm -rf "${build}" && say "  removed csrc/build" \
             || warn "  could not remove ${build} — check the permissions on your checkout"
     fi
-    (( ${#sos[@]}  )) && { rm -f  "${sos[@]}"  && say "  removed ${#sos[@]} stale kernel .so"; }
-    (( ${#eggs[@]} )) && { rm -rf "${eggs[@]}" && say "  removed a stale *.egg-info left by an earlier install"; }
-    [[ -d "${VLLM_ASCEND_DIR}/build" ]] \
-        && { rm -rf "${VLLM_ASCEND_DIR}/build" && say "  removed the setuptools build/ tree"; }
-    if (( PURGE_BUILD_CACHE )); then
-        [[ -d "${cache}" ]] \
-            && { rm -rf "${cache}" && say "  removed csrc/build_cache (PURGE_BUILD_CACHE=1) — a total rebuild"; }
-    elif [[ -d "${cache}" ]]; then
-        say "  csrc/build_cache is KEPT: it is keyed by source content, so its"
-        say "  compiled kernels still match wherever the sources did not move."
-        say "  If this rebuild still fails oddly, drop it too: PURGE_BUILD_CACHE=1"
+    # The .so and the install leftovers go only when the KERNELS are invalid.
+    # A tree from another container does not make them so, and throwing them
+    # away there would turn every recreate into tens of minutes.
+    if (( kernels_too )); then
+        (( ${#sos[@]}  )) && { rm -f  "${sos[@]}"  && say "  removed ${#sos[@]} stale kernel .so"; }
+        (( ${#eggs[@]} )) && { rm -rf "${eggs[@]}" && say "  removed a stale *.egg-info left by an earlier install"; }
+        [[ -d "${VLLM_ASCEND_DIR}/build" ]] \
+            && { rm -rf "${VLLM_ASCEND_DIR}/build" && say "  removed the setuptools build/ tree"; }
+    fi
+    # csrc/build_cache holds compiled kernel objects, not cmake state, so a
+    # container change alone does not condemn it. It is dropped whenever the
+    # kernels are being invalidated anyway, and whenever you ask: a cache that
+    # has to be removed by hand is not one to keep automatically.
+    if [[ -d "${cache}" ]]; then
+        if (( PURGE_BUILD_CACHE )) || (( kernels_too )); then
+            rm -rf "${cache}" && say "  removed csrc/build_cache — the next build is a full one"
+        else
+            say "  csrc/build_cache is KEPT: it holds compiled kernels, not cmake"
+            say "  state, and this reconfigure does not invalidate them. If the"
+            say "  build still fails: PURGE_BUILD_CACHE=1, or --clean-kernels"
+        fi
     fi
     return 0
 }
@@ -941,12 +1042,21 @@ if [[ "${MODE}" == "check" ]]; then
     say "  marker wants : ${BUILD_KEY}"
     say "  marker holds : $( [[ -f "${MARKER}" ]] && tr -d '\r\n' < "${MARKER}" || echo '<no marker file>' )"
     _moved="$(marker_mismatch)" && say "  fields moved : ${_moved}"
-    if [[ -d "${VLLM_ASCEND_DIR}/csrc/build" ]] && [[ ! -f "${MARKER}" ]]; then
-        say "stale output   : csrc/build exists with NO marker — a killed or failed"
-        say "                 build left it; a run without --check removes it first"
-    elif [[ -n "${_moved:-}" ]]; then
-        say "stale output   : the build output in your checkout would be REMOVED"
-        say "                 before installing (a run without --check does it)"
+    _wrote="$(foreign_build_tree)" || _wrote=""
+    say "build tree     : $( [[ -d "${VLLM_ASCEND_DIR}/csrc/build" ]] \
+        && { [[ -n "${_wrote}" ]] && echo "csrc/build was configured by ${_wrote} — FOREIGN" \
+             || echo "csrc/build belongs to this container"; } \
+        || echo 'no csrc/build yet' )"
+    say "  this env     : ${BUILD_ENV_ID:-<unset: run by hand, no claim made>}"
+    if [[ -n "${_moved:-}" ]]; then
+        say "stale output   : the kernels AND cmake's tree would be REMOVED before"
+        say "                 installing — built for a different ${_moved// /, }"
+    elif [[ ! -f "${MARKER}" ]] && [[ -d "${VLLM_ASCEND_DIR}/csrc/build" ]]; then
+        say "stale output   : build output with NO marker — a killed or failed build"
+        say "                 left it; a run without --check removes it first"
+    elif [[ -n "${_wrote}" ]]; then
+        say "stale output   : csrc/build would be REMOVED before installing (a cmake"
+        say "                 reconfigure). Your kernels are kept."
     else
         say "stale output   : none — any build output present was made here"
     fi
@@ -976,8 +1086,11 @@ if [[ "${MODE}" == "check" ]]; then
     for pair in ${BUILD_BINS}; do
         say "  $(printf '%-6s' "${pair%%:*}"): $(command -v "${pair%%:*}" 2>/dev/null || echo 'NOT ON PATH')"
     done
-    if _dead="$(stale_cmake_cache)"; then
-        say "cmake cache    : STALE — names tools that are not in this container:${_dead}"
+    if _ms="$(moved_cmake_source)"; then
+        say "cmake cache    : generated for a DIFFERENT source dir: ${_ms}"
+        say "                 (now ${VLLM_ASCEND_DIR}/csrc — the checkout moved or was renamed)"
+    elif _dead="$(stale_cmake_cache)"; then
+        say "cmake cache    : STALE — caches paths that are not in this container:${_dead}"
         say "  a run without --check drops csrc/build so cmake looks again"
     else
         say "cmake cache    : $( [[ -f "${VLLM_ASCEND_DIR}/csrc/build/CMakeCache.txt" ]] && echo 'present, every recorded tool exists' || echo 'none yet' )"
@@ -1195,16 +1308,28 @@ if (( NEED_ASCEND )); then
         # cache usable" but "was this output made here, from this source".
         purge_stale_build
         (( CLEAN_KERNELS )) && clean_kernel_build
-        if _dead="$(stale_cmake_cache)"; then
-            warn "csrc/build/CMakeCache.txt names tool(s) that do not exist in this
-    container:${_dead}
-    Those paths were recorded by a build in an EARLIER container, and pip
-    installs ninja into the interpreter's bin directory — which went away with
-    that container, while the cache stayed in your checkout. cmake would fail
-    at its first line. Dropping the build tree so it looks again;
-    csrc/build_cache keeps the compiled kernels, so this is not a rebuild from
-    scratch."
-            clean_kernel_build
+        # Both of these should now be unreachable on a recreate, because
+        # purge_stale_build drops a tree from another container outright. They
+        # stay as the backstop for a tree this bundle did not stamp — one built
+        # before the stamp existed, or by hand with BUILD_ENV_ID unset.
+        if _moved_src="$(moved_cmake_source)"; then
+            warn "csrc/build was configured for a DIFFERENT source directory:
+        cached : ${_moved_src}
+        now    : ${VLLM_ASCEND_DIR}/csrc
+    cmake refuses to run against a different source dir than the one its cache
+    was generated for, so this checkout was moved or renamed. Dropping the
+    build tree."
+            rm -rf "${VLLM_ASCEND_DIR}/csrc/build" \
+                || warn "could not remove csrc/build — check permissions on your checkout"
+        elif _dead="$(stale_cmake_cache)"; then
+            warn "csrc/build/CMakeCache.txt caches absolute path(s) that do not exist
+    in this container:${_dead}
+    They were recorded by a build in an EARLIER container — pip installs ninja
+    into the interpreter's bin directory, which went away with that container
+    while the cache stayed in your checkout. cmake would fail at its first
+    line. Dropping the build tree so it configures again."
+            rm -rf "${VLLM_ASCEND_DIR}/csrc/build" \
+                || warn "could not remove csrc/build — check permissions on your checkout"
         fi
         clear_stale_kernel_locks
         # The other way to get "Another process is using this dir": too many
@@ -1275,6 +1400,9 @@ if (( NEED_ASCEND )); then
         say "kernels skipped (COMPILE_CUSTOM_KERNELS=0); no marker written."
     elif have_kernels; then
         echo "${BUILD_KEY}" > "${MARKER}"
+        # Records which container configured csrc/build, so the next container
+        # knows the tree is not its own instead of finding out from cmake.
+        stamp_build_tree
         say "kernels built; marker written to ${MARKER}"
     else
         warn "install finished but no kernel .so matched ${KERNEL_SO_GLOB} under
