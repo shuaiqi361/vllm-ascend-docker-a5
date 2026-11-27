@@ -16,6 +16,7 @@ point at one: `# see NOTES.md: the husk`.
 - [PIP_PINS and PIP_GUARD_PACKAGES](#pip_pins-and-pip_guard_packages)
 - [ais_bench_benchmark — the date-stamped pin](#ais_bench_benchmark--the-date-stamped-pin)
 - [DEVICE_MODE and DRIVER_MOUNT](#device_mode-and-driver_mount)
+- [Build provenance, and purging a cache you cannot trust](#build-provenance-and-purging-a-cache-you-cannot-trust)
 - [no_proxy must cover this host's own names](#no_proxy-must-cover-this-hosts-own-names)
 - [The kernel marker, and "first start is seconds"](#the-kernel-marker-and-first-start-is-seconds)
 - [MOUNT_TOOLS — whose tools/ actually runs](#mount_tools--whose-tools-actually-runs)
@@ -325,12 +326,12 @@ The marker file `KERNEL_MARKER` (`.vllm-ascend-dev-build`) records what the
 build was *for*, as one string:
 
 ```
-soc=<SOC_VERSION>;py=<python X.Y>;img=<image key>
+soc=<SOC_VERSION>;py=<python X.Y>;img=<image key>;src=<git HEAD>;host=<box hash>
 ```
 
-All three matter. `run_container.sh` predicts staleness with the **same string
-comparison** the container makes, before it starts anything, so "first start is
-seconds" can never turn into forty minutes:
+Every field matters. `run_container.sh` predicts staleness with the **same
+field-wise comparison** the container makes, before it starts anything, so
+"first start is seconds" can never turn into forty minutes:
 
 * `soc=` — a different `SOC_VERSION` is a different kernel.
 * `py=` — read from **the image**, by a throwaway `docker run` (`--rm`, no
@@ -343,6 +344,68 @@ seconds" can never turn into forty minutes:
   version string stayed the same. For any other image, its own id, which also
   changes when a tag is re-pulled onto new content — exactly when kernels should
   be rebuilt.
+* `src=` — the checkout's **git HEAD**, short. `HEAD` and not the working tree
+  on purpose: an uncommitted kernel edit *should* go on building incrementally,
+  which is the whole point of mounting your checkout, while a checkout, pull or
+  rebase means the objects under `csrc/build` describe code that is no longer
+  there. Absent when the directory is not a git checkout.
+* `host=` — a short **hash** of this box's `/etc/machine-id` (hostname if there
+  is none). A hash because the marker file sits in your checkout, which is a git
+  repository, and a machine-id does not belong in one.
+
+The comparison is field-wise rather than one string compare, and a field the
+stored marker does not carry counts as **unknown, not wrong**. That is what lets
+fields be added to the key without condemning every build made before they
+existed, and it means `src=` and `host=` cost a check and never a spurious
+rebuild. `run_container.sh` derives both and passes them in — for the same
+reason it passes `IMAGE_REF`: a value derived twice can differ (git inside the
+container needs `safe.directory`, and with `NETWORK=bridge` the container's
+hostname is not the host's), and a key that disagrees with itself reads as a
+stale build *forever*.
+
+## Build provenance, and purging a cache you cannot trust
+
+Build output lives in your **mounted checkout**, so it outlives container stop,
+kill and `rm` — that is what makes "first start is seconds" possible, and it is
+also the one thing in this design that can quietly poison a build. Nothing
+invalidates `csrc/build`, the `.so` or a leftover `*.egg-info` on its own.
+
+Three ways they stop describing what is about to be built, and all three are
+silent until cmake fails strangely — or, worse, succeeds against the wrong
+objects:
+
+| what happened | how it shows in the marker |
+|---|---|
+| a stale build of a different version — `git checkout`, `pull` or `rebase` moved the source under a finished build | `src=` differs |
+| the checkout was built on a **different box**, then copied or moved | `host=` differs |
+| a previous install **failed or was killed** mid-build | there is build output and **no marker at all** |
+
+That last one needs no new state: the bootstrap deletes the marker *before* a
+build starts and writes it only once one has produced a `.so`. So build output
+with no marker beside it is, by construction, the residue of a build that never
+finished.
+
+In all three cases `purge_stale_build` removes, **before** `pip install -e`
+rather than building on top of it: `csrc/build`, the stale `.so`, the top-level
+`build/` tree and any leftover `*.egg-info`. It says which field moved and what
+it removed. When the marker agrees, nothing is touched and cmake stays
+incremental — a purge needs *evidence*, never the mere absence of it.
+
+`csrc/build_cache` is **kept**: it is keyed by source content, so its compiled
+kernels still match wherever the sources did not move, and dropping it turns an
+incremental rebuild into a total one. `PURGE_BUILD_CACHE=1` drops it too, for
+when a purge did not fix the build:
+
+```bash
+PURGE_BUILD_CACHE=1 ./run_container.sh dev --recreate
+```
+
+`./run_container.sh --dry-run` names the fields that moved before it starts
+anything, and inside a container so does
+
+```bash
+$DEV_TOOLS_DIR/bootstrap_editable.sh --check
+```
 
 `KERNEL_SO_GLOB`, `KERNEL_MARKER` and `CATLASS_MARKER` live in `a5.env` so that
 the predicting side and the deciding side cannot disagree about what "already
@@ -440,7 +503,9 @@ when you want to look first.
 
 ## Stale opc locks and stale CMakeCache
 
-Two ways a kernel build fails for a reason that has nothing to do with your code:
+Two narrower faults than the provenance check above, which runs first and may
+have removed the whole tree already. These are what is left when the build
+output *is* ours and still cannot be used as it stands:
 
 * **opc locks.** `csrc/build/**/*kernel_meta*/*.lock` files record a pid. A
   container that was killed mid-build leaves them behind, and the next build

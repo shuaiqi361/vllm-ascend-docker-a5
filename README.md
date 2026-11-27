@@ -208,8 +208,26 @@ before it starts anything, so "first start is seconds" is never a surprise forty
 minutes. Pure-python session in seconds instead:
 `COMPILE_CUSTOM_KERNELS=0 ./run_container.sh py` — the custom ops will then fail.
 
-Why the marker has three parts, and what makes it stale:
-[NOTES.md — The kernel marker](NOTES.md#the-kernel-marker-and-first-start-is-seconds).
+Because that output lives in your checkout, it outlives every container — which
+is the point, and also the one thing that can poison a build. Before installing,
+the bootstrap checks what the marker says the output was made for and **removes
+it rather than build on top of it** when any of these holds:
+
+| | the marker shows |
+|---|---|
+| a stale build of a different version (`git checkout` / `pull` / `rebase` moved the source) | `src=` differs |
+| built on a **different box**, then copied or moved | `host=` differs |
+| a previous install **failed or was killed** mid-build | build output with **no marker** |
+
+It removes `csrc/build`, the stale `.so`, `build/` and any leftover
+`*.egg-info`, and names the field that moved. When the marker agrees nothing is
+touched and cmake stays incremental — a purge needs evidence, not the absence of
+it. `csrc/build_cache` is kept because it is content-keyed; `PURGE_BUILD_CACHE=1`
+drops that too. `--dry-run` tells you all of this before it starts anything.
+
+What each field of the marker means, and why:
+[NOTES.md — The kernel marker](NOTES.md#the-kernel-marker-and-first-start-is-seconds)
+and [Build provenance](NOTES.md#build-provenance-and-purging-a-cache-you-cannot-trust).
 
 ### `bootstrap_editable.sh`, inside the container
 
@@ -223,7 +241,7 @@ docker exec -it NAME bash /opt/vllm-dev/bootstrap_editable.sh --check
 | `--force` | reinstall vllm-ascend and rebuild the kernels, incrementally (after a `csrc/` change) |
 | `--force-all` | also re-install vLLM. Rare. |
 | `--deps` | re-resolve dependencies too (after a `requirements*.txt` change). Needs network in the container. |
-| `--clean-kernels` | `rm -rf csrc/build` first, keeping `csrc/build_cache`. For a build that fails on stale cmake state. |
+| `--clean-kernels` | `rm -rf csrc/build` first, keeping `csrc/build_cache`. For a build that fails on stale cmake state. The provenance purge above is automatic; this is the manual one, for when the marker agrees and the tree is still wrong. |
 | *(none)* | do whatever is missing. This is what the entrypoint runs on every start. |
 
 `./manage_containers.sh` → `c <n>` runs the `--check` for you, and
@@ -273,6 +291,8 @@ what the message looks like:
 | a serve hangs or 502s on its own `/health` | an `http_proxy` swallowing traffic to this host. [NOTES.md](NOTES.md#no_proxy-must-cover-this-hosts-own-names) |
 | your edit to a `tools/` script does nothing | the image's baked copy is what runs. `MOUNT_TOOLS=1`. [NOTES.md](NOTES.md#mount_tools--whose-tools-actually-runs) |
 | a kernel build that should be incremental rebuilds everything, or waits forever | a stale `CMakeCache.txt` or a stale opc lock. [NOTES.md](NOTES.md#stale-opc-locks-and-stale-cmakecache) |
+| a `--recreate` says `removing stale build output` and rebuilds | the build in your checkout was made for a different source commit, image or box, or by a build that was killed. Intended: it is removed rather than built on. `--dry-run` names the field. [NOTES.md](NOTES.md#build-provenance-and-purging-a-cache-you-cannot-trust) |
+| a rebuild after a purge still fails in cmake or links the wrong objects | `csrc/build_cache` survived the purge. `PURGE_BUILD_CACHE=1 ./run_container.sh dev --recreate`. [NOTES.md](NOTES.md#build-provenance-and-purging-a-cache-you-cannot-trust) |
 | `[ascend_env] no …/ascend-toolkit/set_env.sh` | the image keeps CANN somewhere other than `ASCEND_HOME`. `./probe_image.sh <ref>` prints where. |
 | `cannot talk to the docker daemon` | `systemctl start docker`, or you are not in the `docker` group yet (`newgrp docker`). |
 

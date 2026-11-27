@@ -23,7 +23,9 @@
 #    --deps           resolve dependencies too, after a requirements*.txt change.
 #    --force-all      re-install vllm as well. Rare; after a failed bootstrap.
 #    --clean-kernels  delete csrc/build, KEEP csrc/build_cache, for a build tree
-#                     in a state a lock sweep does not explain.
+#                     in a state a lock sweep does not explain. The provenance
+#                     purge below is automatic; this is the manual one, for when
+#                     the marker agrees and the tree is still wrong.
 #
 #  You edited PYTHON? Run nothing — the sources are bind-mounted and editable.
 #
@@ -32,6 +34,13 @@
 #  build backend must already be importable (--no-build-isolation fetches
 #  nothing), git must accept the checkouts and every submodule, and no husk
 #  directory may shadow the install. see NOTES.md: The husk, git safe.directory
+#
+#  Build output lives in your CHECKOUT, so it outlives every container. Before
+#  installing, the marker is checked against this container and this source: a
+#  build made for a different soc / python / image / commit / box, or one left
+#  by an install that was killed, is REMOVED rather than built on top of. A
+#  marker that agrees is left alone, so cmake stays incremental.
+#  see NOTES.md: Build provenance, and purging a cache you cannot trust
 #
 #  Costs: once per CONTAINER, the editable installs; once per CHECKOUT, the
 #  custom kernels (tens of minutes, landing on the HOST so a stop/start never
@@ -102,6 +111,11 @@ TRITON_WHEEL_DIR="${TRITON_WHEEL_DIR:-}"
 # 0 = report and refuse. The alternative to 1 is python importing an empty
 # module and every number you measure being wrong.
 PURGE_HUSK="${PURGE_HUSK:-1}"
+# 1 = a purge also drops csrc/build_cache, the content-keyed store behind the
+# log's "[build-cache] HIT". Kept by default: dropping it turns an incremental
+# rebuild into a total one. Set it when a purge did not fix the build.
+# see NOTES.md: Build provenance, and purging a cache you cannot trust
+PURGE_BUILD_CACHE="${PURGE_BUILD_CACHE:-0}"
 
 MODE="auto"
 WITH_DEPS=0
@@ -733,6 +747,16 @@ fi
 # BASE_IMAGE override untouched.
 PY_TAG="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 BUILD_KEY="soc=${SOC_VERSION};py=${PY_TAG};img=${IMAGE_REF:-${IMAGE_CANN_VERSION:-unknown}}"
+# src= and host= answer "from THESE sources, on THIS box?". run_container.sh
+# derives both and passes them, for the reason it passes IMAGE_REF: it predicts
+# staleness before starting anything, and a value derived twice can differ —
+# git in here needs safe.directory, and with NETWORK=bridge this container's
+# hostname is not the host's — which would read as a stale build forever.
+# Appended only when known, because marker_mismatch treats an absent field as
+# UNKNOWN, and unknown must never cost a rebuild.
+# see NOTES.md: Build provenance, and purging a cache you cannot trust
+[[ -n "${SRC_REF:-}" ]]       && BUILD_KEY="${BUILD_KEY};src=${SRC_REF}"
+[[ -n "${BUILD_HOST_ID:-}" ]] && BUILD_KEY="${BUILD_KEY};host=${BUILD_HOST_ID}"
 
 have_kernels() {
     compgen -G "${VLLM_ASCEND_DIR}/${KERNEL_SO_GLOB}" > /dev/null 2>&1
@@ -803,8 +827,80 @@ clean_kernel_build() {
     say "  and this costs far less than a first build."
     rm -rf "${build}" || warn "could not remove ${build} — check permissions on your checkout"
 }
+# Field-wise rather than one string comparison, so a field the stored marker
+# does not carry is treated as UNKNOWN and not as a mismatch. That is what lets
+# src= and host= be added without condemning every build made before they
+# existed: only a field present on both sides and DIFFERING condemns one.
+marker_mismatch() {   # prints the field names that moved; returns 0 if any did
+    [[ -f "${MARKER}" ]] || return 1
+    local stored field k want have out=""
+    stored=";$(tr -d '\r\n' < "${MARKER}" 2>/dev/null);"
+    for field in ${BUILD_KEY//;/ }; do
+        k="${field%%=*}"; want="${field#*=}"
+        # Anchored on the separator: a value could otherwise contain a key name.
+        case "${stored}" in *";${k}="*) ;; *) continue ;; esac
+        have="${stored#*;${k}=}"; have="${have%%;*}"
+        [[ "${have}" == "${want}" ]] || out="${out} ${k}"
+    done
+    [[ -n "${out}" ]] || return 1
+    printf '%s\n' "${out# }"
+}
 marker_ok() {
-    [[ -f "${MARKER}" ]] && [[ "$(cat "${MARKER}" 2>/dev/null)" == "${BUILD_KEY}" ]]
+    [[ -f "${MARKER}" ]] && ! marker_mismatch >/dev/null
+}
+
+# Build output lives in your MOUNTED checkout, so it outlives every container
+# and nothing invalidates it on its own. Three ways it stops describing what is
+# about to be built, all of them silent until cmake fails strangely or — worse —
+# succeeds against the wrong objects:
+#   * the marker records a different soc, python, image or source commit;
+#   * the marker records a different box;
+#   * there is build output and NO marker, which is exactly what a build that
+#     was killed or failed leaves: the marker is deleted before a build starts
+#     and written only once one has produced a .so.
+# A first build has no output and so no decision to make.
+# see NOTES.md: Build provenance, and purging a cache you cannot trust
+purge_stale_build() {
+    local build="${VLLM_ASCEND_DIR}/csrc/build"
+    local cache="${VLLM_ASCEND_DIR}/csrc/build_cache"
+    local reason moved
+    local -a sos=() eggs=()
+    mapfile -t sos  < <(compgen -G "${VLLM_ASCEND_DIR}/${KERNEL_SO_GLOB}" 2>/dev/null)
+    mapfile -t eggs < <(compgen -G "${VLLM_ASCEND_DIR}/*.egg-info" 2>/dev/null)
+    [[ -d "${build}" || ${#sos[@]} -gt 0 ]] || return 0
+
+    if moved="$(marker_mismatch)"; then
+        reason="it was built for a different ${moved// /, }"
+    elif [[ ! -f "${MARKER}" ]]; then
+        reason="there is build output but no ${KERNEL_MARKER}, so whatever produced it never finished"
+    else
+        return 0   # the marker agrees: this tree is ours, and cmake is incremental
+    fi
+
+    warn "removing stale build output from your checkout before installing:
+    ${reason}.
+        marker holds : $( [[ -f "${MARKER}" ]] && tr -d '\r\n' < "${MARKER}" || echo '<no marker file>' )
+        marker wants : ${BUILD_KEY}
+    Keeping it would feed cmake objects and a CMakeCache that do not match this
+    toolchain or these sources. csrc/ is rebuilt from scratch below."
+    rm -f "${MARKER}"
+    if [[ -d "${build}" ]]; then
+        rm -rf "${build}" && say "  removed csrc/build" \
+            || warn "  could not remove ${build} — check the permissions on your checkout"
+    fi
+    (( ${#sos[@]}  )) && { rm -f  "${sos[@]}"  && say "  removed ${#sos[@]} stale kernel .so"; }
+    (( ${#eggs[@]} )) && { rm -rf "${eggs[@]}" && say "  removed a stale *.egg-info left by an earlier install"; }
+    [[ -d "${VLLM_ASCEND_DIR}/build" ]] \
+        && { rm -rf "${VLLM_ASCEND_DIR}/build" && say "  removed the setuptools build/ tree"; }
+    if (( PURGE_BUILD_CACHE )); then
+        [[ -d "${cache}" ]] \
+            && { rm -rf "${cache}" && say "  removed csrc/build_cache (PURGE_BUILD_CACHE=1) — a total rebuild"; }
+    elif [[ -d "${cache}" ]]; then
+        say "  csrc/build_cache is KEPT: it is keyed by source content, so its"
+        say "  compiled kernels still match wherever the sources did not move."
+        say "  If this rebuild still fails oddly, drop it too: PURGE_BUILD_CACHE=1"
+    fi
+    return 0
 }
 
 NEED_VLLM=0
@@ -843,7 +939,17 @@ if [[ "${MODE}" == "check" ]]; then
     say "kernels present: $(have_kernels && echo yes || echo no)"
     say "marker current : $(marker_ok && echo yes || echo no)"
     say "  marker wants : ${BUILD_KEY}"
-    say "  marker holds : $( [[ -f "${MARKER}" ]] && cat "${MARKER}" || echo '<no marker file>' )"
+    say "  marker holds : $( [[ -f "${MARKER}" ]] && tr -d '\r\n' < "${MARKER}" || echo '<no marker file>' )"
+    _moved="$(marker_mismatch)" && say "  fields moved : ${_moved}"
+    if [[ -d "${VLLM_ASCEND_DIR}/csrc/build" ]] && [[ ! -f "${MARKER}" ]]; then
+        say "stale output   : csrc/build exists with NO marker — a killed or failed"
+        say "                 build left it; a run without --check removes it first"
+    elif [[ -n "${_moved:-}" ]]; then
+        say "stale output   : the build output in your checkout would be REMOVED"
+        say "                 before installing (a run without --check does it)"
+    else
+        say "stale output   : none — any build output present was made here"
+    fi
     say "would reinstall vllm: ${NEED_VLLM}, vllm-ascend: ${NEED_ASCEND}"
     # Whether a "<not importable>" is a missing install or a husk shadowing a
     # good one. Opposite fixes.
@@ -1084,6 +1190,10 @@ if (( NEED_ASCEND )); then
     back, in that checkout:  git config core.autocrlf false && git config core.eol lf"
     fi
     if (( COMPILE_CUSTOM_KERNELS )); then
+        # First, because it can remove the whole tree the two checks below
+        # inspect — and because its question is the broader one: not "is this
+        # cache usable" but "was this output made here, from this source".
+        purge_stale_build
         (( CLEAN_KERNELS )) && clean_kernel_build
         if _dead="$(stale_cmake_cache)"; then
             warn "csrc/build/CMakeCache.txt names tool(s) that do not exist in this

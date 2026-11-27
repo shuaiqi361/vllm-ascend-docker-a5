@@ -633,22 +633,56 @@ fi
 # image its own id, which also changes when a tag is re-pulled onto new content.
 # see NOTES.md: The kernel marker, and "first start is seconds"
 IMAGE_KEY="${IMG_BASE:-${IMG_ID:0:19}}"
-BUILD_KEY="soc=${SOC_VERSION};py=${PROBE_PY};img=${IMAGE_KEY}"
+# The source the build was made from. HEAD, not the working tree: an
+# uncommitted kernel edit SHOULD go on building incrementally, while a
+# checkout, pull or rebase means the objects in csrc/build describe code that
+# is no longer there. Empty when this is not a git checkout — then the field is
+# simply not asserted. see NOTES.md: Build provenance
+SRC_REF="$(git -C "${VLLM_ASCEND_DIR}" rev-parse --short=12 HEAD 2>/dev/null)"
+# Which box. A hash, never the id itself: this lands in a marker file inside
+# your checkout, and a machine-id does not belong in a git repository.
+host_build_id() {
+    local raw=""
+    [[ -r /etc/machine-id ]] && raw="$(cat /etc/machine-id 2>/dev/null)"
+    [[ -n "${raw}" ]] || raw="$(hostname 2>/dev/null)"
+    [[ -n "${raw}" ]] || return 0
+    if command -v md5sum >/dev/null 2>&1; then
+        printf '%s' "${raw}" | md5sum | cut -c1-12
+    else
+        printf '%s\n' "${raw//[^A-Za-z0-9]/}" | cut -c1-12
+    fi
+}
+BUILD_HOST_ID="$(host_build_id)"
 
-# When the image's python is known this is the container's exact string
-# comparison. When it is not, it falls back to the two facts we do have.
+BUILD_KEY="soc=${SOC_VERSION};py=${PROBE_PY};img=${IMAGE_KEY}"
+[[ -n "${SRC_REF}" ]]       && BUILD_KEY="${BUILD_KEY};src=${SRC_REF}"
+[[ -n "${BUILD_HOST_ID}" ]] && BUILD_KEY="${BUILD_KEY};host=${BUILD_HOST_ID}"
+
+# The SAME field-wise comparison the container makes, so the prediction here and
+# the decision there cannot disagree: a field the stored marker does not carry
+# is unknown rather than wrong, and only a field present on both sides and
+# differing makes a build stale. An unknown image python drops py= from the
+# question instead of guessing at it.
+marker_moved() {   # prints the field names that moved; returns 0 if any did
+    local mk="${VLLM_ASCEND_DIR}/${KERNEL_MARKER}" stored field k want have out=""
+    [[ -f "${mk}" ]] || return 1
+    stored=";$(tr -d '\r\n' < "${mk}" 2>/dev/null);"
+    for field in ${BUILD_KEY//;/ }; do
+        k="${field%%=*}"; want="${field#*=}"
+        [[ "${k}" == "py" && "${PROBE_PY}" == "unknown" ]] && continue
+        case "${stored}" in *";${k}="*) ;; *) continue ;; esac
+        have="${stored#*;${k}=}"; have="${have%%;*}"
+        [[ "${have}" == "${want}" ]] || out="${out} ${k}"
+    done
+    [[ -n "${out}" ]] || return 1
+    printf '%s\n' "${out# }"
+}
 kernel_state() {
     compgen -G "${VLLM_ASCEND_DIR}/${KERNEL_SO_GLOB}" >/dev/null 2>&1 || { echo missing; return; }
-    local mk="${VLLM_ASCEND_DIR}/${KERNEL_MARKER}"
-    [[ -f "${mk}" ]] || { echo stale; return; }
-    if [[ "${PROBE_PY}" != "unknown" ]]; then
-        [[ "$(cat "${mk}" 2>/dev/null)" == "${BUILD_KEY}" ]] && echo built || echo stale
-        return
-    fi
-    grep -q "soc=${SOC_VERSION};" "${mk}" 2>/dev/null || { echo stale; return; }
-    if [[ -n "${IMAGE_KEY}" ]] && ! grep -qF "img=${IMAGE_KEY}" "${mk}" 2>/dev/null; then
-        echo stale; return
-    fi
+    # Build output with no marker beside it is what a killed or failed build
+    # leaves: the container removes it and rebuilds rather than trust it.
+    [[ -f "${VLLM_ASCEND_DIR}/${KERNEL_MARKER}" ]] || { echo stale; return; }
+    marker_moved >/dev/null && { echo stale; return; }
     echo built
 }
 if [[ ! -d "${VLLM_ASCEND_DIR}" ]]; then
@@ -666,14 +700,24 @@ else
             KERNELS_NOTE="already built in your checkout — first start is seconds"
             say "kernels: already built for this SoC, python and image — first start is seconds" ;;
         stale)
-            KERNELS_NOTE="WILL BE REBUILT (the marker does not match this SoC / python / image)"
-            warn "the kernels in ${VLLM_ASCEND_DIR} were built for something else, so the
-    first start REBUILDS them — tens of minutes, once.
+            MOVED="$(marker_moved)"
+            if [[ -n "${MOVED}" ]]; then
+                KERNELS_NOTE="WILL BE REBUILT (built for a different ${MOVED// /, })"
+                STALE_WHY="they were built for a different ${MOVED// /, }"
+            else
+                KERNELS_NOTE="WILL BE REBUILT (build output with no marker: a build that never finished)"
+                STALE_WHY="there is build output but no ${KERNEL_MARKER}, so the build
+    that produced it was killed or failed"
+            fi
+            warn "the kernels in ${VLLM_ASCEND_DIR} cannot be used as they are:
+    ${STALE_WHY}.
         marker wants : ${BUILD_KEY}
         marker holds : $( [[ -f "${VLLM_ASCEND_DIR}/${KERNEL_MARKER}" ]] \
-                            && cat "${VLLM_ASCEND_DIR}/${KERNEL_MARKER}" \
+                            && tr -d '\r\n' < "${VLLM_ASCEND_DIR}/${KERNEL_MARKER}" \
                             || echo '<no marker file>' )
-    Watch it with: docker logs -f ${NAME}" ;;
+    The first start REMOVES that stale output — csrc/build, the .so and the
+    leftover *.egg-info — and rebuilds: tens of minutes, once. csrc/build_cache
+    is kept, so cache hits survive. Watch it with: docker logs -f ${NAME}" ;;
         missing)
             KERNELS_NOTE="WILL BE BUILT on first start"
             warn "that vllm-ascend checkout has no built kernels yet, so the first
@@ -869,6 +913,13 @@ ENV_ARGS=(
 # see NOTES.md: Knobs nothing sets
 OPTIONAL_ENV=(
     MAX_JOBS PIP_INDEX_URL
+    # The two halves of the build's provenance, derived here so that the
+    # prediction above and the decision in the container are one answer. Each
+    # is omitted when it could not be derived, which the container reads as
+    # "unknown" and never as "stale". see NOTES.md: Build provenance
+    SRC_REF BUILD_HOST_ID
+    # 1 = a purge drops csrc/build_cache as well. see NOTES.md: Build provenance
+    PURGE_BUILD_CACHE
     # 0 turns the bootstrap's husk removal into a report. see NOTES.md: The husk
     PURGE_HUSK
     # Where the bootstrap writes the == entries of PIP_PINS as a pip constraints
