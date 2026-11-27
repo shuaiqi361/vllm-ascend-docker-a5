@@ -1,0 +1,10 @@
+# Everything here runs on Linux. A clone must have LF endings whatever the
+# platform it lands on: a \r in a sourced env file becomes part of a value, and
+# in a script it is a bash syntax error. git normalises on commit and checks
+# these out as LF even where core.autocrlf is true.
+*           text=auto eol=lf
+*.sh        text eol=lf
+a5.env      text eol=lf
+a5.env.*    text eol=lf
+Dockerfile* text eol=lf
+*.md        text eol=lf

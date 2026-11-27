@@ -1,0 +1,7 @@
+# Your own paths and profiles — personal, never shared.
+a5.env.local
+profiles/
+
+# build_image.sh writes its logs under LOG_DIR; this catches a stray one here.
+*.log
+logs/

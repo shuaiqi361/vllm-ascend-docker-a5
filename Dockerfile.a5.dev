@@ -1,0 +1,368 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+#
+# =============================================================================
+#  Dockerfile.a5.dev — a DEPENDENCY image for developing vllm-ascend on
+#  A5 / 950DT Products. Derived from vllm-ascend/Dockerfile.a5.openEuler.
+#
+#  Dependencies only — no vllm, no vllm-ascend, no path of yours. run_container.sh
+#  bind-mounts your checkouts and bootstrap_editable.sh pip-installs them
+#  editable at start, so a python edit is live with no rebuild, and the only
+#  absolute paths below are container paths passed as build args.
+#  see NOTES.md: The one idea
+#
+#  You may not need this file: run_container.sh runs ANY image with CANN,
+#  torch-npu and a compiler, and ./probe_image.sh <ref> says whether one
+#  qualifies. see NOTES.md: Two routes to a container
+#
+#  BASE_KIND shapes a build — cann installs everything below (tens of minutes,
+#  ~25-30G), ready adds only the dev plumbing to an existing vllm-ascend runtime
+#  image. SEED_DEPS=1 clones and installs UPSTREAM vllm + vllm-ascend into
+#  ${UPSTREAM_DIR} so a container's first start is a seconds-long
+#  `pip install -e . --no-deps`. see NOTES.md: SEED_DEPS — the dependency baseline
+#
+#  LAYER ORDER IS DELIBERATE. A build arg joins the cache key of every layer
+#  that REFERENCES it and invalidates everything after it, so knobs you change
+#  often are read as late as possible: the two slow baseline installs sit above
+#  the cheap ones, and per-server values — SOC_VERSION above all — only in the
+#  last metadata layers, where a change costs nothing.
+#
+#  Do not build this by hand — build_image.sh passes every ARG below from
+#  a5.env, and warns if the two lists have drifted. See README.md.
+# =============================================================================
+
+# a5.env builds this from CANN_REGISTRY / CANN_VERSION / CANN_IMAGE_SUFFIX. One
+# of only two ARGs with a default: FROM needs a value before anything can run.
+ARG BASE_IMAGE="swr.cn-north-12.myhuaweicloud.com/atlas_inference/cann:9.3.0_20261113161300-950-openeuler24.03-py3.12"
+
+FROM ${BASE_IMAGE}
+
+# ───────────────────────── build arguments ───────────────────────────────────
+# Declared WITHOUT defaults on purpose: a second default here could drift from
+# a5.env's, and which one won would depend on how the build was invoked.
+# BASE_IMAGE above and CANN_VERSION (only ever recorded) are the exceptions.
+ARG BASE_IMAGE
+ARG CANN_VERSION="unknown"
+# cann = a plain CANN base, install everything.  ready = dev plumbing only.
+ARG BASE_KIND
+# update = distro update then the list.  install = the list only.  skip = nothing.
+ARG SYS_PACKAGES
+
+# Container paths — never looked for on the build host.
+ARG ASCEND_HOME
+ARG DEV_TOOLS_DIR
+ARG UPSTREAM_DIR
+# The upstream dependency baseline (see the header).
+ARG SEED_DEPS
+ARG UPSTREAM_VLLM_REPO
+ARG UPSTREAM_VLLM_TAG
+ARG UPSTREAM_VLLM_COMMIT
+ARG UPSTREAM_VLLM_ASCEND_REPO
+ARG UPSTREAM_VLLM_ASCEND_REF
+# ASCEND_INDEX_URL is a SPACE-SEPARATED list, so it goes through PIP_EXTRA_INDEX_URL,
+# which accepts a list, and not --extra-index-url, which does not.
+ARG PIP_INDEX_URL
+ARG PYTORCH_INDEX_URL
+ARG ASCEND_INDEX_URL
+# Bound build parallelism, and therefore memory. Empty = one job per core.
+ARG MAX_JOBS
+ARG CARGO_BUILD_JOBS
+ARG INSTALL_RUST_FRONTEND
+ARG INSTALL_DEV_REQS
+# A5 extras, matched to the CANN in the base image.
+ARG INSTALL_FLA
+ARG FLA_PACKAGE
+ARG FLA_VERSION
+ARG FLASH_ATTN_NPU_VERSION
+ARG FLASH_ATTN_BUILD_NPU
+ARG MF_SOC
+ARG INSTALL_CANNBOT
+ARG CANNBOT_DSL_VERSION
+ARG CANNBOT_NET_OPS_VERSION
+ARG INSTALL_MOONCAKE
+ARG MOONCAKE_VERSION
+# Read only in the last metadata layer, so changing it rebuilds nothing.
+ARG SOC_VERSION
+
+# Nothing is built here; run_container.sh passes the real working dir with -w.
+WORKDIR /
+
+SHELL ["/bin/bash", "-c"]
+
+# Upstream's A5 list, plus git (the baseline clone needs it) and conveniences.
+# Both yum and apt-get are handled: several vllm-ascend dev images are
+# Ubuntu-based and have no yum. see NOTES.md: BASE_KIND and SYS_PACKAGES
+RUN if [ "${SYS_PACKAGES}" = "skip" ]; then \
+        echo "SYS_PACKAGES=skip — leaving system packages alone"; \
+    elif command -v yum >/dev/null 2>&1; then \
+        if [ "${SYS_PACKAGES}" = "update" ]; then yum update -y; fi && \
+        yum --setopt=sslverify=false install -y git vim wget curl jq protobuf protobuf-devel protobuf-compiler \
+            net-tools gcc gcc-c++ make cmake numactl numactl-devel libibverbs-devel \
+            jemalloc hiredis-devel clang patch \
+            rsync tmux htop lsof strace tree bash-completion pciutils iproute && \
+        rm -rf /var/cache/yum/*; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+        export DEBIAN_FRONTEND=noninteractive && \
+        apt-get update && \
+        if [ "${SYS_PACKAGES}" = "update" ]; then apt-get upgrade -y; fi && \
+        apt-get install -y --no-install-recommends \
+            git vim wget curl jq protobuf-compiler libprotobuf-dev \
+            net-tools gcc g++ make cmake numactl libnuma-dev libibverbs-dev \
+            libjemalloc2 libhiredis-dev clang patch \
+            rsync tmux htop lsof strace tree bash-completion pciutils iproute2 && \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "neither yum nor apt-get in this base — skipping system packages" >&2; \
+    fi
+
+# Optional internal pypi mirror.
+RUN if [ -n "${PIP_INDEX_URL}" ]; then \
+        python3 -m pip config set global.index-url "${PIP_INDEX_URL}" && \
+        python3 -m pip config set global.trusted-host "$(echo "${PIP_INDEX_URL}" | awk -F[/:] '{print $4}')"; \
+    fi
+
+# modelscope and ray at upstream's pins. Skipped on a ready base: these pins
+# have upper bounds and could DOWNgrade a working ray under a working vllm.
+RUN if [ "${BASE_KIND}" = "ready" ]; then \
+        echo "BASE_KIND=ready — leaving modelscope / ray / protobuf as this base has them"; \
+    else \
+        python3 -m pip install 'modelscope<1.38' 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
+        python3 -m pip cache purge; \
+    fi
+
+# Build-backend dependencies in the MAIN site-packages: the container-side
+# installs use --no-build-isolation, which cannot see a temp env pip discards.
+RUN python3 -m pip install "setuptools>=64" "setuptools-scm>=8" setuptools_rust wheel pybind11 \
+        "cmake>=3.26" ninja attrs psutil googleapis-common-protos && \
+    python3 -m pip cache purge
+
+# Without these a hand-run `docker build` bakes an empty ASCEND_HOME into the
+# profile below and the image's CANN environment silently does nothing. Placed
+# just before the first layer that uses them, so it adds to no cache key.
+RUN missing=""; \
+    for v in ASCEND_HOME DEV_TOOLS_DIR UPSTREAM_DIR SEED_DEPS; do \
+        eval "val=\${$v}"; [ -n "${val}" ] || missing="${missing} ${v}"; \
+    done; \
+    if [ -n "${missing}" ]; then \
+        echo ""; \
+        echo "=============================================================="; \
+        echo " build-arg not set:${missing}"; \
+        echo ""; \
+        echo " Do not run 'docker build' by hand. Use:"; \
+        echo "     ./build_image.sh"; \
+        echo " which reads a5.env and passes every ARG in this file."; \
+        echo "=============================================================="; \
+        echo ""; \
+        exit 1; \
+    fi; \
+    echo "container paths ok: ASCEND_HOME=${ASCEND_HOME} DEV_TOOLS_DIR=${DEV_TOOLS_DIR} UPSTREAM_DIR=${UPSTREAM_DIR}"
+
+# ───────────────── the CANN environment, written down ONCE ───────────────
+# Everything needing the CANN env sources this one file, so the LD_LIBRARY_PATH
+# a kernel build sees cannot depend on how you entered the container. It lives
+# in tools/ because run_container.sh bind-mounts tools/ into images this file
+# never touched. see NOTES.md: ascend_env.sh picks exactly one toolkit
+#
+# COPYed here as well as with the rest of tools/ at the bottom, because the
+# layers below source it — affordable only because it changes about never, and
+# it keeps an edit to the bootstrap or entrypoint out of these early layers.
+#
+# /etc/profile.d, not a .bashrc: HOME points at your MOUNTED home, so the
+# image's ~/.bashrc is never read, while a login shell still reads profile.d.
+COPY tools/ascend_env.sh ${DEV_TOOLS_DIR}/ascend_env.sh
+RUN cp ${DEV_TOOLS_DIR}/ascend_env.sh /etc/profile.d/ascend_env.sh && \
+    chmod 644 /etc/profile.d/ascend_env.sh ${DEV_TOOLS_DIR}/ascend_env.sh && \
+    echo 'source /etc/profile.d/ascend_env.sh' >> /root/.bashrc && \
+    source /etc/profile.d/ascend_env.sh && \
+    echo "CANN env ok: ASCEND_HOME=${ASCEND_HOME}  toolkit=$(command -v ascend-dmi || echo n/a)"
+
+# ─────────────── upstream baseline 1/2: vLLM at the pinned tag ───────────────
+# VLLM_TARGET_DEVICE=empty: vLLM builds no device code, the Ascend plugin
+# supplies it. triton arrives with vLLM but is broken on Ascend, so it goes
+# straight back out (vllm-ascend installs triton-ascend instead).
+RUN if [ "${SEED_DEPS}" != "1" ]; then \
+        if [ "${BASE_KIND}" = "ready" ]; then \
+            echo "BASE_KIND=ready — this base already has vllm and its dependencies."; \
+        else \
+            echo "SEED_DEPS=0 — no upstream vLLM baseline. The first container start"; \
+            echo "will have to resolve every dependency itself, with network, slowly."; \
+        fi; \
+    else \
+        mkdir -p "${UPSTREAM_DIR}" && \
+        if [ -n "${UPSTREAM_VLLM_COMMIT}" ]; then \
+            git init -q "${UPSTREAM_DIR}/vllm" && \
+            git -C "${UPSTREAM_DIR}/vllm" fetch --depth 1 "${UPSTREAM_VLLM_REPO}" "${UPSTREAM_VLLM_COMMIT}" && \
+            git -C "${UPSTREAM_DIR}/vllm" checkout -q FETCH_HEAD; \
+        else \
+            git clone --depth 1 -b "${UPSTREAM_VLLM_TAG}" "${UPSTREAM_VLLM_REPO}" "${UPSTREAM_DIR}/vllm"; \
+        fi && \
+        VLLM_TARGET_DEVICE="empty" \
+        python3 -m pip install -e "${UPSTREAM_DIR}/vllm/[audio]" \
+            --extra-index-url ${PYTORCH_INDEX_URL} && \
+        python3 -m pip uninstall -y triton && \
+        python3 -m pip cache purge; \
+    fi
+
+# vLLM's optional Rust frontend. Its layout moved between releases, so both
+# script locations are probed and a vLLM with neither is not an error.
+# /root/.cargo is where rustup installs for the BUILD user, not the runtime HOME.
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN if [ "${SEED_DEPS}" != "1" ] || [ "${INSTALL_RUST_FRONTEND}" != "1" ]; then \
+        echo "skipping the Rust frontend"; \
+    elif ! command -v cargo >/dev/null 2>&1; then \
+        echo "WARNING: cargo is not in this base image — skipping the Rust frontend."; \
+        echo "         Set INSTALL_RUST_FRONTEND=0 in a5.env to silence this."; \
+    else \
+        cd "${UPSTREAM_DIR}/vllm" && \
+        export PROTOC_INCLUDE=/usr/include && \
+        if [ -n "${CARGO_BUILD_JOBS}" ]; then export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}"; fi && \
+        if [ -f requirements/build/rust.txt ]; then \
+            python3 -m pip install -r requirements/build/rust.txt; \
+        else \
+            python3 -m pip install setuptools-rust; \
+        fi && \
+        if [ -f tools/build_rust.sh ]; then bash tools/build_rust.sh; \
+        elif [ -f build_rust.sh ]; then bash build_rust.sh; \
+        else echo "no build_rust.sh in this vLLM — nothing to build"; fi && \
+        python3 -m pip cache purge; \
+    fi
+
+# ──────────── upstream baseline 2/2: vllm-ascend and its deps ────────────────
+# COMPILE_CUSTOM_KERNELS=0: the kernels that matter are built into YOUR checkout
+# at container start, and anything compiled here would be hidden by the bind
+# mount — which also keeps this step quick and free of the catlass submodule.
+# SOC_VERSION below is a LITERAL, not the build arg: setup.py refuses to run
+# without one, it changes nothing with kernels off, and referencing the ARG
+# would put a per-server value in the cache key of the file's slowest layer.
+ENV SOC_VERSION=ascend950dt_9582 \
+    TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1
+RUN if [ "${SEED_DEPS}" != "1" ]; then echo "SEED_DEPS=0 — no vllm-ascend baseline"; else \
+        git clone --depth 1 -b "${UPSTREAM_VLLM_ASCEND_REF}" \
+            "${UPSTREAM_VLLM_ASCEND_REPO}" "${UPSTREAM_DIR}/vllm-ascend" && \
+        source /etc/profile.d/ascend_env.sh && \
+        export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+        export VLLM_BATCH_INVARIANT=1 && \
+        export COMPILE_CUSTOM_KERNELS=0 && \
+        if [ -n "${MAX_JOBS}" ]; then \
+            export MAX_JOBS="${MAX_JOBS}" CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}"; \
+        fi && \
+        python3 -m pip install -e "${UPSTREAM_DIR}/vllm-ascend/" \
+            --extra-index-url ${PYTORCH_INDEX_URL} && \
+        python3 -m pip uninstall -y triton && \
+        python3 -m pip cache purge; \
+    fi
+
+# ───────────────────────── cheap layers, read late ───────────────────────────
+# Quick layers only, below the baselines so these knobs re-run no slow install.
+
+# Dev/test requirements, so `pytest tests/ut` works inside the container.
+RUN if [ "${SEED_DEPS}" != "1" ] || [ "${INSTALL_DEV_REQS}" != "1" ]; then \
+        echo "skipping requirements-dev.txt"; \
+    elif [ -f "${UPSTREAM_DIR}/vllm-ascend/requirements-dev.txt" ]; then \
+        export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+        python3 -m pip install -r "${UPSTREAM_DIR}/vllm-ascend/requirements-dev.txt" \
+            --extra-index-url ${PYTORCH_INDEX_URL} && \
+        python3 -m pip cache purge; \
+    else \
+        echo "no requirements-dev.txt in this vllm-ascend"; \
+    fi
+
+# ===== memfabric kernels, FLA, flash-attn-npu =====
+# mfcli ships with memfabric-hybrid and flash-attn-npu builds against torch, so
+# this needs SEED_DEPS=1 and has to come after it.
+RUN if [ "${INSTALL_FLA}" != "1" ]; then \
+        echo "skipping FLA / flash-attn-npu"; \
+    elif [ "${SEED_DEPS}" != "1" ]; then \
+        echo "SEED_DEPS=0 — skipping FLA / flash-attn-npu: they need torch and"; \
+        echo "mfcli, which come with the baseline. Install them inside the"; \
+        echo "container once your checkouts are in place."; \
+    else \
+        source /etc/profile.d/ascend_env.sh && \
+        export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+        TORCH_DEVICE_BACKEND_AUTOLOAD=0 mfcli kernel install --soc-version "${MF_SOC}" --install-for-all && \
+        python3 -m pip install --force-reinstall --no-deps "${FLA_PACKAGE}===${FLA_VERSION}" && \
+        FLASH_ATTN_BUILD_NPU="${FLASH_ATTN_BUILD_NPU}" \
+            python3 -m pip install --no-build-isolation --no-deps \
+            "flash-attn-npu==${FLASH_ATTN_NPU_VERSION}" && \
+        python3 -m pip cache purge; \
+    fi
+
+# Mooncake transfer engine (disaggregated prefill / KV transfer). Its own layer
+# and knob: inside the FLA block, INSTALL_FLA=0 silently took mooncake with it.
+RUN if [ "${INSTALL_MOONCAKE}" != "1" ]; then echo "skipping mooncake"; else \
+        PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" \
+        python3 -m pip install "mooncake-transfer-engine-npu===${MOONCAKE_VERSION}" && \
+        python3 -m pip cache purge; \
+    fi
+
+# cannbot wheels from the Ascend mirror (A5 only upstream). An unsupported
+# architecture warns and skips, like every other optional install here.
+RUN if [ "${INSTALL_CANNBOT}" != "1" ]; then \
+        echo "skipping cannbot"; \
+    else \
+        case "$(uname -m)" in \
+          aarch64|x86_64) \
+            PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" \
+            python3 -m pip install "cannbotdsl===${CANNBOT_DSL_VERSION}" \
+                                   "cannbot-arena-net-ops===${CANNBOT_NET_OPS_VERSION}" && \
+            python3 -m pip cache purge ;; \
+          *) echo "WARNING: no cannbot wheels for $(uname -m) — skipping." ;; \
+        esac; \
+    fi
+
+# ───────────────────────── dev workflow plumbing ─────────────────────────────
+# Scripts that run INSIDE the container, both safe to re-run by hand. Copied
+# last, so editing them rebuilds only these trailing cheap layers.
+COPY tools/ ${DEV_TOOLS_DIR}/
+# ENTRYPOINT's exec form cannot expand variables, so it must name one fixed
+# path; this symlink is how DEV_TOOLS_DIR stays configurable anyway.
+RUN chmod +x ${DEV_TOOLS_DIR}/*.sh && \
+    ln -sf ${DEV_TOOLS_DIR}/entrypoint.sh /usr/local/bin/vllm-dev-entrypoint
+
+# IMAGE_REF is the staleness key for a host-side kernel build — the exact
+# reference this was built FROM, so a CANN change reached by overriding
+# BASE_IMAGE still reads as different (CANN_VERSION would not).
+# see NOTES.md: The kernel marker, and "first start is seconds"
+RUN printf '%s\n' \
+        "IMAGE_REF=${BASE_IMAGE}" \
+        "IMAGE_CANN_VERSION=${CANN_VERSION}" \
+        "IMAGE_UPSTREAM_DIR=${UPSTREAM_DIR}" \
+        > ${DEV_TOOLS_DIR}/image-info.env
+
+# The facts the HOST tools read, as labels, so run_container.sh can get them
+# with `docker image inspect` without starting a container.
+LABEL vllm-ascend-dev.kind="deps-only" \
+      vllm-ascend-dev.base-image="${BASE_IMAGE}" \
+      vllm-ascend-dev.base-kind="${BASE_KIND}" \
+      vllm-ascend-dev.cann="${CANN_VERSION}" \
+      vllm-ascend-dev.seed-deps="${SEED_DEPS}" \
+      vllm-ascend-dev.upstream-dir="${UPSTREAM_DIR}" \
+      vllm-ascend-dev.upstream-vllm="${UPSTREAM_VLLM_COMMIT:-${UPSTREAM_VLLM_TAG}}" \
+      vllm-ascend-dev.upstream-vllm-ascend="${UPSTREAM_VLLM_ASCEND_REF}" \
+      vllm-ascend-dev.tools-dir="${DEV_TOOLS_DIR}" \
+      vllm-ascend-dev.soc-default="${SOC_VERSION}"
+
+# SOC_VERSION is referenced only here and in the LABEL above — the two cheapest
+# layers in the file — so changing it rebuilds metadata and nothing else.
+ENV ASCEND_HOME=${ASCEND_HOME} \
+    DEV_TOOLS_DIR=${DEV_TOOLS_DIR} \
+    UPSTREAM_DIR=${UPSTREAM_DIR} \
+    SOC_VERSION=${SOC_VERSION} \
+    PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["/usr/local/bin/vllm-dev-entrypoint"]
+CMD ["sleep", "infinity"]

@@ -1,0 +1,7 @@
+# The docker build context is this folder, and the only thing
+# Dockerfile.a5.dev copies out of it is tools/. Everything else is excluded, so
+# your env files (a5.env.local in particular) can never end up inside an image,
+# and the context stays a few kilobytes.
+*
+!tools
+!tools/*
